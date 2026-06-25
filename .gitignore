@@ -1,0 +1,9 @@
+Makefile
+*.o
+*.bundle
+*.so
+*.dSYM/
+mkmf.log
+*.gem
+/pkg/
+/benchmark/

@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gem:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git init .
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "${GITHUB_REF}"
+          git checkout --force FETCH_HEAD
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev build-essential libbrotli-dev
+
+      - name: Build gem
+        run: gem build brotli_splice.gemspec
+
+      - name: Smoke install packaged gem
+        run: |
+          smoke_dir="$(mktemp -d)"
+          export GEM_HOME="${smoke_dir}/gems"
+          export GEM_PATH="${GEM_HOME}"
+          export PATH="${smoke_dir}/bin:${PATH}"
+
+          gem install --local ./brotli_splice-*.gem \
+            --install-dir "${GEM_HOME}" \
+            --bindir "${smoke_dir}/bin" \
+            --no-document
+
+          ruby - <<'RUBY'
+          require "brotli_splice"
+
+          html = "prefix-PLACEHOLDER-suffix"
+          secret_offset = html.index("PLACEHOLDER")
+          result = BrotliSplice.encode(html, secret_offset, "PLACEHOLDER".bytesize, quality: 1)
+          replacement = "TOKEN".ljust(result[:secret_length], ".")
+          BrotliSplice.replace(result[:data], replacement, result[:secret_offset], result[:secret_length])
+
+          puts BrotliSplice::VERSION
+          RUBY
