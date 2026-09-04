@@ -99,6 +99,24 @@ ruby -Ilib test_ext.rb
 
 ## API
 
+### `BrotliSplice::Encoder`
+
+Use the stateful encoder when the full document is not available up front:
+
+```ruby
+encoder = BrotliSplice::Encoder.new(quality: 5, lgwin: 22)
+compressed = encoder.write("<html><head>".b)
+compressed << encoder.write("<title>Store</title>".b)
+compressed << encoder.slot("live-token\r\n".b)
+compressed << encoder.finish("</head><body>...</body></html>".b)
+```
+
+`write` flushes and byte-aligns each chunk. `slot` may be called once. Its input must end in the fixed `"\r\n"` context suffix, which is not replaceable. `finish` closes the stream and can include a final chunk. Strings are treated as byte sequences regardless of their Ruby encoding.
+
+After `slot`, `slot_offset` and `slot_length` identify the raw replaceable bytes in the combined compressed output. `context_suffix` returns `"\r\n"`.
+
+Call `close` when abandoning an unfinished encoder. It releases native state without producing output and is safe to call more than once or after `finish`. Once an encoder is closed, finished, or fails after consuming input, later encoding operations raise `BrotliSplice::Error`.
+
 ### `BrotliSplice.encode(html, secret_offset, secret_length, quality: 11) → Hash`
 
 Compress `html` with a spliceable slot at the given byte position.
@@ -167,7 +185,7 @@ longer, or place the suffix where a line break is natural).
 
 ## Limitations
 
-- The replaceable slot must be ≤ 65534 bytes (64KB minus the 2-byte context)
+- The replaceable slot must be no larger than 65536 bytes, plus the 2-byte context suffix
 - The replacement must be **exactly** `secret_length` bytes (no length changes)
 - The last 2 bytes of the original secret region become `\r\n` in the output
 - Only one spliceable slot per stream (encode with multiple slots would require
