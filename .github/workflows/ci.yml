@@ -27,6 +27,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ruby ruby-dev build-essential libbrotli-dev
 
+      - name: Run tests
+        run: |
+          sudo gem install bundler --no-document
+          bundle config set path vendor/bundle
+          bundle install
+          bundle exec rake test
+
       - name: Build gem
         run: gem build brotli_splice.gemspec
 

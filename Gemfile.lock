@@ -1,11 +1,13 @@
 PATH
   remote: .
   specs:
-    brotli_splice (0.1.1)
+    brotli_splice (0.2.0)
 
 GEM
   remote: https://rubygems.org/
   specs:
+    brotli (0.8.0)
+    minitest (5.27.0)
     rake (13.3.0)
 
 PLATFORMS
@@ -13,7 +15,9 @@ PLATFORMS
   ruby
 
 DEPENDENCIES
+  brotli
   brotli_splice!
+  minitest (>= 5, < 6)
   rake
 
 BUNDLED WITH
