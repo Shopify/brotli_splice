@@ -27,15 +27,20 @@ typedef enum {
 } encoder_lifecycle_t;
 
 typedef struct {
+    size_t offset;
+    size_t length;
+} slot_position_t;
+
+typedef struct {
     BrotliEncoderState *encoder;
     int quality;
     int lgwin;
     size_t uncompressed_bytes;
     size_t bytes_written;
-    size_t slot_offset;
-    size_t slot_length;
+    slot_position_t *slots;
+    size_t slot_count;
+    size_t slot_capacity;
     size_t native_bytes;
-    int has_slot;
     encoder_lifecycle_t lifecycle;
 } splice_encoder_t;
 
@@ -87,6 +92,7 @@ static void encoder_terminalize(splice_encoder_t *encoder, encoder_lifecycle_t l
 static void encoder_free(void *pointer) {
     splice_encoder_t *encoder = pointer;
     encoder_destroy_native(encoder);
+    xfree(encoder->slots);
     xfree(encoder);
 }
 
@@ -94,8 +100,9 @@ static size_t encoder_memsize(const void *pointer) {
     if (!pointer) return 0;
 
     const splice_encoder_t *encoder = pointer;
-    if (encoder->native_bytes > SIZE_MAX - sizeof(splice_encoder_t)) return SIZE_MAX;
-    return sizeof(splice_encoder_t) + encoder->native_bytes;
+    size_t fixed_size = sizeof(splice_encoder_t) + encoder->slot_capacity * sizeof(slot_position_t);
+    if (encoder->native_bytes > SIZE_MAX - fixed_size) return SIZE_MAX;
+    return fixed_size + encoder->native_bytes;
 }
 
 static const rb_data_type_t encoder_type = {
@@ -319,12 +326,24 @@ static VALUE encoder_slot_operation(VALUE opaque) {
         CTX_LEN);
     rb_str_concat(output, context_output);
 
-    encoder->slot_offset = encoder->bytes_written + flushed_length + sizeof(header);
-    encoder->slot_length = body_length;
-    encoder->has_slot = 1;
+    encoder->slots[encoder->slot_count].offset = encoder->bytes_written + flushed_length + sizeof(header);
+    encoder->slots[encoder->slot_count].length = body_length;
+    encoder->slot_count++;
     encoder->bytes_written += flushed_length + sizeof(header) + body_length + (size_t)RSTRING_LEN(context_output);
     encoder->uncompressed_bytes += body_length + CTX_LEN;
     return output;
+}
+
+/*
+ * Grows the slot list before any stream bytes are produced, so a failed
+ * allocation leaves the encoder usable and the stream unchanged.
+ */
+static void reserve_slot(splice_encoder_t *encoder) {
+    if (encoder->slot_count < encoder->slot_capacity) return;
+
+    size_t capacity = encoder->slot_capacity ? encoder->slot_capacity * 2 : 4;
+    REALLOC_N(encoder->slots, slot_position_t, capacity);
+    encoder->slot_capacity = capacity;
 }
 
 static VALUE encoder_slot(VALUE self, VALUE bytes) {
@@ -332,8 +351,6 @@ static VALUE encoder_slot(VALUE self, VALUE bytes) {
     TypedData_Get_Struct(self, splice_encoder_t, &encoder_type, encoder);
     ensure_writable(encoder);
     check_string(bytes);
-
-    if (encoder->has_slot) rb_raise(eBrotliSpliceError, "slot may only be written once");
 
     size_t total_length = (size_t)RSTRING_LEN(bytes);
     if (total_length <= CTX_LEN) rb_raise(eBrotliSpliceError, "slot must be longer than 2 bytes");
@@ -343,6 +360,8 @@ static VALUE encoder_slot(VALUE self, VALUE bytes) {
     if (memcmp(RSTRING_PTR(bytes) + body_length, CTX_BYTES, CTX_LEN) != 0) {
         rb_raise(eBrotliSpliceError, "slot must end with the context suffix \\r\\n");
     }
+
+    reserve_slot(encoder);
 
     encoder_operation_t arguments = {encoder, bytes};
     return run_encoder_operation(encoder, encoder_slot_operation, &arguments);
@@ -386,16 +405,36 @@ static VALUE encoder_close(VALUE self) {
     return Qnil;
 }
 
+static const slot_position_t *last_slot(const splice_encoder_t *encoder) {
+    return encoder->slot_count ? &encoder->slots[encoder->slot_count - 1] : NULL;
+}
+
 static VALUE encoder_slot_offset(VALUE self) {
     splice_encoder_t *encoder;
     TypedData_Get_Struct(self, splice_encoder_t, &encoder_type, encoder);
-    return encoder->has_slot ? SIZET2NUM(encoder->slot_offset) : Qnil;
+    const slot_position_t *slot = last_slot(encoder);
+    return slot ? SIZET2NUM(slot->offset) : Qnil;
 }
 
 static VALUE encoder_slot_length(VALUE self) {
     splice_encoder_t *encoder;
     TypedData_Get_Struct(self, splice_encoder_t, &encoder_type, encoder);
-    return encoder->has_slot ? SIZET2NUM(encoder->slot_length) : Qnil;
+    const slot_position_t *slot = last_slot(encoder);
+    return slot ? SIZET2NUM(slot->length) : Qnil;
+}
+
+static VALUE encoder_slots(VALUE self) {
+    splice_encoder_t *encoder;
+    TypedData_Get_Struct(self, splice_encoder_t, &encoder_type, encoder);
+
+    VALUE slots = rb_ary_new_capa((long)encoder->slot_count);
+    for (size_t index = 0; index < encoder->slot_count; index++) {
+        VALUE slot = rb_hash_new();
+        rb_hash_aset(slot, ID2SYM(rb_intern("offset")), SIZET2NUM(encoder->slots[index].offset));
+        rb_hash_aset(slot, ID2SYM(rb_intern("length")), SIZET2NUM(encoder->slots[index].length));
+        rb_ary_push(slots, slot);
+    }
+    return slots;
 }
 
 static VALUE encoder_context_suffix(VALUE self) {
@@ -404,27 +443,58 @@ static VALUE encoder_context_suffix(VALUE self) {
 
 typedef struct {
     VALUE encoder;
-    VALUE prefix;
-    VALUE slot;
-    VALUE suffix;
+    VALUE pieces;
 } encode_operation_t;
 
+/*
+ * Pieces alternate between compressed chunks and slots, starting and ending
+ * with a compressed chunk: [chunk, slot, chunk, slot, ..., chunk].
+ */
 static VALUE encode_operation(VALUE opaque) {
     encode_operation_t *arguments = (encode_operation_t *)opaque;
-    VALUE data = rb_funcall(arguments->encoder, rb_intern("write"), 1, arguments->prefix);
-    rb_str_concat(data, rb_funcall(arguments->encoder, rb_intern("slot"), 1, arguments->slot));
-    rb_str_concat(data, rb_funcall(arguments->encoder, rb_intern("finish"), 1, arguments->suffix));
-
-    VALUE result = rb_hash_new();
-    rb_hash_aset(result, ID2SYM(rb_intern("data")), data);
-    rb_hash_aset(result, ID2SYM(rb_intern("secret_offset")), rb_funcall(arguments->encoder, rb_intern("slot_offset"), 0));
-    rb_hash_aset(result, ID2SYM(rb_intern("secret_length")), rb_funcall(arguments->encoder, rb_intern("slot_length"), 0));
-    rb_hash_aset(result, ID2SYM(rb_intern("context_suffix")), encoder_context_suffix(arguments->encoder));
-    return result;
+    long last = RARRAY_LEN(arguments->pieces) - 1;
+    VALUE data = binary_string(NULL, 0);
+    for (long index = 0; index < last; index += 2) {
+        rb_str_concat(data, rb_funcall(arguments->encoder, rb_intern("write"), 1, RARRAY_AREF(arguments->pieces, index)));
+        rb_str_concat(data, rb_funcall(arguments->encoder, rb_intern("slot"), 1, RARRAY_AREF(arguments->pieces, index + 1)));
+    }
+    rb_str_concat(data, rb_funcall(arguments->encoder, rb_intern("finish"), 1, RARRAY_AREF(arguments->pieces, last)));
+    return data;
 }
 
 static VALUE close_encoder_ensure(VALUE encoder_value) {
     return encoder_close(encoder_value);
+}
+
+static VALUE new_encoder_with_options(VALUE options) {
+    return rb_class_new_instance_kw(NIL_P(options) ? 0 : 1, NIL_P(options) ? NULL : &options, cEncoder, RB_PASS_KEYWORDS);
+}
+
+static VALUE encode_pieces(VALUE encoder, VALUE pieces) {
+    encode_operation_t arguments = {encoder, pieces};
+    return rb_ensure(encode_operation, (VALUE)&arguments, close_encoder_ensure, encoder);
+}
+
+/*
+ * `bounds` holds validated, ascending, non-overlapping [offset, length] pairs.
+ * Each slot copy ends in the context suffix, which `Encoder#slot` requires.
+ */
+static VALUE slot_pieces(VALUE html, const size_t *bounds, long count) {
+    VALUE pieces = rb_ary_new_capa(count * 2 + 1);
+    size_t position = 0;
+    for (long index = 0; index < count; index++) {
+        size_t offset = bounds[index * 2];
+        size_t length = bounds[index * 2 + 1];
+        rb_ary_push(pieces, binary_string((const uint8_t *)RSTRING_PTR(html) + position, offset - position));
+
+        VALUE slot = binary_string((const uint8_t *)RSTRING_PTR(html) + offset, length);
+        rb_str_modify(slot);
+        memcpy(RSTRING_PTR(slot) + length - CTX_LEN, CTX_BYTES, CTX_LEN);
+        rb_ary_push(pieces, slot);
+        position = offset + length;
+    }
+    rb_ary_push(pieces, binary_string((const uint8_t *)RSTRING_PTR(html) + position, (size_t)RSTRING_LEN(html) - position));
+    return pieces;
 }
 
 static VALUE rb_brotli_splice_encode(int argc, VALUE *argv, VALUE self) {
@@ -440,17 +510,63 @@ static VALUE rb_brotli_splice_encode(int argc, VALUE *argv, VALUE self) {
         rb_raise(eBrotliSpliceError, "secret_offset + secret_length exceeds html size");
     }
 
-    VALUE prefix = binary_string((const uint8_t *)RSTRING_PTR(html), secret_offset);
-    VALUE slot = binary_string((const uint8_t *)RSTRING_PTR(html) + secret_offset, secret_length);
-    VALUE suffix = binary_string(
-        (const uint8_t *)RSTRING_PTR(html) + secret_offset + secret_length,
-        html_length - secret_offset - secret_length);
-    rb_str_modify(slot);
-    memcpy(RSTRING_PTR(slot) + secret_length - CTX_LEN, CTX_BYTES, CTX_LEN);
+    size_t bounds[2] = {secret_offset, secret_length};
+    VALUE pieces = slot_pieces(html, bounds, 1);
+    VALUE encoder = new_encoder_with_options(options);
+    VALUE data = encode_pieces(encoder, pieces);
 
-    VALUE encoder = rb_class_new_instance_kw(NIL_P(options) ? 0 : 1, NIL_P(options) ? NULL : &options, cEncoder, RB_PASS_KEYWORDS);
-    encode_operation_t arguments = {encoder, prefix, slot, suffix};
-    return rb_ensure(encode_operation, (VALUE)&arguments, close_encoder_ensure, encoder);
+    VALUE result = rb_hash_new();
+    rb_hash_aset(result, ID2SYM(rb_intern("data")), data);
+    rb_hash_aset(result, ID2SYM(rb_intern("secret_offset")), encoder_slot_offset(encoder));
+    rb_hash_aset(result, ID2SYM(rb_intern("secret_length")), encoder_slot_length(encoder));
+    rb_hash_aset(result, ID2SYM(rb_intern("context_suffix")), encoder_context_suffix(encoder));
+    return result;
+}
+
+static VALUE rb_brotli_splice_encode_slots(int argc, VALUE *argv, VALUE self) {
+    VALUE html, slots, options;
+    rb_scan_args(argc, argv, "2:", &html, &slots, &options);
+    Check_Type(html, T_STRING);
+    Check_Type(slots, T_ARRAY);
+
+    /*
+     * Coerce every pair before validating any of them: numeric coercion can run
+     * Ruby code that changes `html`.
+     */
+    long count = RARRAY_LEN(slots);
+    VALUE bounds_buffer;
+    size_t *bounds = ALLOCV_N(size_t, bounds_buffer, (size_t)count * 2);
+    for (long index = 0; index < count; index++) {
+        VALUE slot = rb_ary_entry(slots, index);
+        Check_Type(slot, T_ARRAY);
+        if (RARRAY_LEN(slot) != 2) rb_raise(rb_eArgError, "each slot must be an [offset, length] pair");
+        bounds[index * 2] = NUM2SIZET(rb_ary_entry(slot, 0));
+        bounds[index * 2 + 1] = NUM2SIZET(rb_ary_entry(slot, 1));
+    }
+
+    size_t html_length = (size_t)RSTRING_LEN(html);
+    size_t previous_end = 0;
+    for (long index = 0; index < count; index++) {
+        size_t offset = bounds[index * 2];
+        size_t length = bounds[index * 2 + 1];
+        if (length <= CTX_LEN) rb_raise(eBrotliSpliceError, "slot length must be > %d", CTX_LEN);
+        if (offset > html_length || length > html_length - offset) {
+            rb_raise(eBrotliSpliceError, "slot offset + length exceeds html size");
+        }
+        if (offset < previous_end) rb_raise(eBrotliSpliceError, "slots must be in ascending order and must not overlap");
+        previous_end = offset + length;
+    }
+
+    VALUE pieces = slot_pieces(html, bounds, count);
+    ALLOCV_END(bounds_buffer);
+    VALUE encoder = new_encoder_with_options(options);
+    VALUE data = encode_pieces(encoder, pieces);
+
+    VALUE result = rb_hash_new();
+    rb_hash_aset(result, ID2SYM(rb_intern("data")), data);
+    rb_hash_aset(result, ID2SYM(rb_intern("slots")), encoder_slots(encoder));
+    rb_hash_aset(result, ID2SYM(rb_intern("context_suffix")), encoder_context_suffix(encoder));
+    return result;
 }
 
 static VALUE rb_brotli_splice_replace(VALUE self, VALUE data, VALUE secret,
@@ -473,6 +589,55 @@ static VALUE rb_brotli_splice_replace(VALUE self, VALUE data, VALUE secret,
     return result;
 }
 
+static VALUE rb_brotli_splice_replace_slots(VALUE self, VALUE data, VALUE replacements) {
+    Check_Type(data, T_STRING);
+    Check_Type(replacements, T_ARRAY);
+
+    /*
+     * Coerce every entry before validating any of them: numeric coercion can run
+     * Ruby code that changes `data` or a secret.
+     */
+    long count = RARRAY_LEN(replacements);
+    VALUE secrets = rb_ary_new_capa(count);
+    VALUE bounds_buffer;
+    size_t *bounds = ALLOCV_N(size_t, bounds_buffer, (size_t)count * 2);
+    for (long index = 0; index < count; index++) {
+        VALUE replacement = rb_ary_entry(replacements, index);
+        Check_Type(replacement, T_ARRAY);
+        if (RARRAY_LEN(replacement) != 3) {
+            rb_raise(rb_eArgError, "each replacement must be a [secret, offset, length] triple");
+        }
+        VALUE secret = rb_ary_entry(replacement, 0);
+        Check_Type(secret, T_STRING);
+        rb_ary_push(secrets, secret);
+        bounds[index * 2] = NUM2SIZET(rb_ary_entry(replacement, 1));
+        bounds[index * 2 + 1] = NUM2SIZET(rb_ary_entry(replacement, 2));
+    }
+
+    size_t data_length = (size_t)RSTRING_LEN(data);
+    for (long index = 0; index < count; index++) {
+        VALUE secret = RARRAY_AREF(secrets, index);
+        size_t offset = bounds[index * 2];
+        size_t length = bounds[index * 2 + 1];
+        if ((size_t)RSTRING_LEN(secret) != length) {
+            rb_raise(eBrotliSpliceError, "secret length %ld != expected %zu", RSTRING_LEN(secret), length);
+        }
+        if (offset > data_length || length > data_length - offset) {
+            rb_raise(eBrotliSpliceError, "offset+length exceeds data size");
+        }
+    }
+
+    VALUE result = rb_str_dup(data);
+    rb_str_modify(result);
+    for (long index = 0; index < count; index++) {
+        VALUE secret = RARRAY_AREF(secrets, index);
+        memcpy(RSTRING_PTR(result) + bounds[index * 2], RSTRING_PTR(secret), bounds[index * 2 + 1]);
+    }
+    ALLOCV_END(bounds_buffer);
+    RB_GC_GUARD(secrets);
+    return result;
+}
+
 void Init_brotli_splice(void) {
     mBrotliSplice = rb_define_module("BrotliSplice");
     eBrotliSpliceError = rb_define_class_under(mBrotliSplice, "Error", rb_eRuntimeError);
@@ -487,8 +652,11 @@ void Init_brotli_splice(void) {
     rb_define_method(cEncoder, "close", encoder_close, 0);
     rb_define_method(cEncoder, "slot_offset", encoder_slot_offset, 0);
     rb_define_method(cEncoder, "slot_length", encoder_slot_length, 0);
+    rb_define_method(cEncoder, "slots", encoder_slots, 0);
     rb_define_method(cEncoder, "context_suffix", encoder_context_suffix, 0);
 
     rb_define_singleton_method(mBrotliSplice, "encode", rb_brotli_splice_encode, -1);
+    rb_define_singleton_method(mBrotliSplice, "encode_slots", rb_brotli_splice_encode_slots, -1);
     rb_define_singleton_method(mBrotliSplice, "replace", rb_brotli_splice_replace, 4);
+    rb_define_singleton_method(mBrotliSplice, "replace_slots", rb_brotli_splice_replace_slots, 2);
 }

@@ -8,7 +8,7 @@ Gem::Specification.new do |spec|
   spec.summary = "Create Brotli streams with fixed-length spliceable slots"
   spec.description = <<~DESC
     BrotliSplice is a Ruby C extension that creates Brotli-compressed streams
-    containing a fixed-length uncompressed slot. The slot can be overwritten
+    containing fixed-length uncompressed slots. Each slot can be overwritten
     with a simple byte copy, making it useful for injecting fixed-size secrets
     or tokens into pre-compressed HTML responses.
   DESC

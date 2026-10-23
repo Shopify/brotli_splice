@@ -148,7 +148,6 @@ class BrotliSpliceEncoderTest < Minitest::Test
     assert_equal("café".b, Brotli.inflate(utf8_compressed))
 
     encoder.slot(binary("slot\r\n"))
-    assert_raises(BrotliSplice::Error) { encoder.slot(binary("slot\r\n")) }
     encoder.finish
     assert_raises(BrotliSplice::Error) { encoder.write(binary("late")) }
   end
@@ -247,6 +246,157 @@ class BrotliSpliceEncoderTest < Minitest::Test
 
     assert_equal(html, Brotli.inflate(streaming))
     assert_operator(streaming.bytesize - one_shot[:data].bytesize, :<=, 64)
+  end
+
+  def test_streaming_slots_are_each_replaceable
+    encoder = BrotliSplice::Encoder.new(quality: 5)
+    compressed = encoder.write(binary("<head>"))
+    compressed << encoder.slot(binary("first-slot\r\n"))
+    compressed << encoder.write(binary("<title>Store</title>"))
+    compressed << encoder.slot(binary("second-slot\r\n"))
+    compressed << encoder.finish(binary("</head>"))
+
+    first, second = encoder.slots
+    assert_equal([10, 11], [first[:length], second[:length]])
+    assert_equal([second[:offset], second[:length]], [encoder.slot_offset, encoder.slot_length])
+
+    replaced = BrotliSplice.replace(compressed, binary("FIRST-SLOT"), first[:offset], first[:length])
+    assert_equal("<head>FIRST-SLOT\r\n<title>Store</title>second-slot\r\n</head>", Brotli.inflate(replaced))
+    replaced = BrotliSplice.replace(replaced, binary("SECOND-SLOT"), second[:offset], second[:length])
+    assert_equal("<head>FIRST-SLOT\r\n<title>Store</title>SECOND-SLOT\r\n</head>", Brotli.inflate(replaced))
+  end
+
+  def test_adjacent_slots_decode_and_replace
+    encoder = BrotliSplice::Encoder.new(quality: 5)
+    compressed = encoder.slot(binary("aaaa\r\n"))
+    compressed << encoder.slot(binary("bbbb\r\n"))
+    compressed << encoder.finish(binary("tail"))
+
+    assert_equal("aaaa\r\nbbbb\r\ntail", Brotli.inflate(compressed))
+    replacements = encoder.slots.zip(["AAAA", "BBBB"]).map do |slot, value|
+      [binary(value), slot[:offset], slot[:length]]
+    end
+    assert_equal("AAAA\r\nBBBB\r\ntail", Brotli.inflate(BrotliSplice.replace_slots(compressed, replacements)))
+  end
+
+  def test_encode_slots_with_one_slot_matches_encode
+    html = binary("<html><head>" + ("<p>storefront</p>" * 50) + "placeholder\r\n</head></html>")
+    offset = html.index("placeholder")
+    length = binary("placeholder\r\n").bytesize
+
+    single = BrotliSplice.encode(html, offset, length, quality: 5)
+    multiple = BrotliSplice.encode_slots(html, [[offset, length]], quality: 5)
+
+    assert_equal(single[:data], multiple[:data])
+    assert_equal([{ offset: single[:secret_offset], length: single[:secret_length] }], multiple[:slots])
+    assert_equal(single[:context_suffix], multiple[:context_suffix])
+  end
+
+  def test_encode_slots_and_replace_slots_round_trip
+    html = "<title>Café 中文</title><script>var a = {SLOT-A##};</script><div>body</div>" \
+      "<meta content=\"SLOT-B##\"><p>end</p><i>SLOT-C##</i>"
+    slots = ["SLOT-A##", "SLOT-B##", "SLOT-C##"].map { |placeholder| [html.b.index(placeholder), placeholder.bytesize] }
+
+    result = BrotliSplice.encode_slots(html, slots, quality: 5)
+
+    assert_equal(html.b.gsub("##", "\r\n"), Brotli.inflate(result[:data]))
+    replacements = result[:slots].zip(["111111", "222222", "333333"]).map do |slot, value|
+      [binary(value), slot[:offset], slot[:length]]
+    end
+    replaced = BrotliSplice.replace_slots(result[:data], replacements)
+    sequential = replacements.reduce(result[:data]) do |data, (secret, offset, length)|
+      BrotliSplice.replace(data, secret, offset, length)
+    end
+    assert_equal(sequential, replaced)
+    assert_equal(
+      html.b.sub("SLOT-A##", "111111\r\n").sub("SLOT-B##", "222222\r\n").sub("SLOT-C##", "333333\r\n"),
+      Brotli.inflate(replaced),
+    )
+    assert_equal(html.b.gsub("##", "\r\n"), Brotli.inflate(result[:data]))
+  end
+
+  def test_slots_past_the_window_decode_and_replace
+    random = Random.new(42)
+    words = ["product", "collection", "<div class=\"price\">", "</div>", "checkout", "description", " "]
+    html = binary("")
+    slots = []
+    40.times do |index|
+      html << binary(Array.new(80) { words.sample(random: random) }.join)
+      placeholder = binary("slot-#{index}".ljust(16, ".") + "\r\n")
+      slots << [html.bytesize, placeholder.bytesize]
+      html << placeholder
+    end
+    html << binary(Array.new(80) { words.sample(random: random) }.join)
+
+    result = BrotliSplice.encode_slots(html, slots, quality: 5, lgwin: 10)
+
+    assert_operator(html.bytesize, :>, 20 * 1024)
+    assert_equal(html, Brotli.inflate(result[:data]))
+    expected = html.dup
+    replacements = result[:slots].each_with_index.map do |slot, index|
+      value = binary("value-#{index}".ljust(slot[:length], "!"))
+      expected[slots[index][0], slot[:length]] = value
+      [value, slot[:offset], slot[:length]]
+    end
+    assert_equal(expected, Brotli.inflate(BrotliSplice.replace_slots(result[:data], replacements)))
+  end
+
+  def test_encode_slots_without_slots
+    result = BrotliSplice.encode_slots(binary("no slots"), [], quality: 5)
+
+    assert_equal("no slots", Brotli.inflate(result[:data]))
+    assert_equal([], result[:slots])
+  end
+
+  def test_encode_slots_rejects_invalid_slots
+    html = binary("aaaa\r\nbbbb\r\ncccc")
+
+    assert_equal(2, BrotliSplice.encode_slots(html, [[0, 6], [6, 6]])[:slots].size)
+    assert_raises(BrotliSplice::Error) { BrotliSplice.encode_slots(html, [[6, 6], [0, 6]]) }
+    assert_raises(BrotliSplice::Error) { BrotliSplice.encode_slots(html, [[0, 6], [4, 6]]) }
+    assert_raises(BrotliSplice::Error) { BrotliSplice.encode_slots(html, [[0, 2]]) }
+    assert_raises(BrotliSplice::Error) { BrotliSplice.encode_slots(html, [[12, 6]]) }
+    assert_raises(ArgumentError) { BrotliSplice.encode_slots(html, [[0, 6, 1]]) }
+    assert_raises(TypeError) { BrotliSplice.encode_slots(html, [0, 6]) }
+  end
+
+  def test_encode_slots_rechecks_input_length_after_numeric_coercion
+    html = binary("slot\r\n")
+    length = Object.new
+    length.define_singleton_method(:to_int) do
+      html.replace("x")
+      6
+    end
+
+    assert_raises(BrotliSplice::Error) { BrotliSplice.encode_slots(html, [[0, length]]) }
+  end
+
+  def test_replace_slots_rejects_invalid_replacements_without_touching_the_input
+    result = BrotliSplice.encode_slots(binary("aaaa\r\nbbbb\r\n"), [[0, 6], [6, 6]], quality: 5)
+    first, second = result[:slots]
+    data = result[:data].freeze
+
+    assert_raises(BrotliSplice::Error) do
+      BrotliSplice.replace_slots(
+        data,
+        [[binary("AAAA"), first[:offset], first[:length]], [binary("BB"), second[:offset], second[:length]]],
+      )
+    end
+    assert_raises(BrotliSplice::Error) { BrotliSplice.replace_slots(data, [[binary("AAAA"), data.bytesize - 2, 4]]) }
+    assert_equal("aaaa\r\nbbbb\r\n", Brotli.inflate(data))
+  end
+
+  def test_replace_slots_rechecks_secret_length_after_numeric_coercion
+    result = BrotliSplice.encode_slots(binary("aaaa\r\n"), [[0, 6]], quality: 5)
+    slot = result[:slots].first
+    secret = binary("AAAA")
+    offset = Object.new
+    offset.define_singleton_method(:to_int) do
+      secret.replace("A")
+      slot[:offset]
+    end
+
+    assert_raises(BrotliSplice::Error) { BrotliSplice.replace_slots(result[:data], [[secret, offset, slot[:length]]]) }
   end
 
   private
