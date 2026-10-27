@@ -1,7 +1,7 @@
 # BrotliSplice
 
-A Ruby C extension that produces Brotli-compressed streams with a fixed-length
-**spliceable slot** — a region whose raw bytes can be overwritten without
+A Ruby C extension that produces Brotli-compressed streams with fixed-length
+**spliceable slots** — regions whose raw bytes can be overwritten without
 decompressing or re-encoding the rest of the stream.
 
 ## Use case
@@ -32,6 +32,11 @@ The last 2 bytes of the secret slot are reserved as a fixed **context suffix**
 (`\r\n`). These are baked into chunk3 and cannot be changed — the Brotli encoder
 uses the preceding 2 bytes as literal context when compressing part3. The
 replaceable portion is therefore `secret_length - 2` bytes.
+
+A stream can hold several slots. Each slot repeats the same layout: the encoder
+flushes, writes the slot as an uncompressed meta-block, and continues with a
+fresh encoder at the new stream offset. Every slot has its own context suffix
+and adds its own share of the overhead described below.
 
 Compression overhead vs standard Brotli is small — typically 100–200 bytes
 for realistic HTML documents. Two sources of overhead:
@@ -111,9 +116,9 @@ compressed << encoder.slot("live-token\r\n".b)
 compressed << encoder.finish("</head><body>...</body></html>".b)
 ```
 
-`write` flushes and byte-aligns each chunk. `slot` may be called once. Its input must end in the fixed `"\r\n"` context suffix, which is not replaceable. `finish` closes the stream and can include a final chunk. Strings are treated as byte sequences regardless of their Ruby encoding.
+`write` flushes and byte-aligns each chunk. `slot` may be called any number of times. Its input must end in the fixed `"\r\n"` context suffix, which is not replaceable. `finish` closes the stream and can include a final chunk. Strings are treated as byte sequences regardless of their Ruby encoding.
 
-After `slot`, `slot_offset` and `slot_length` identify the raw replaceable bytes in the combined compressed output. `context_suffix` returns `"\r\n"`.
+After `slot`, `slot_offset` and `slot_length` identify the raw replaceable bytes of the most recent slot in the combined compressed output. `slots` lists every slot in stream order as `{ offset:, length: }` hashes. `context_suffix` returns `"\r\n"`.
 
 Call `close` when abandoning an unfinished encoder. It releases native state without producing output and is safe to call more than once or after `finish`. Once an encoder is closed, finished, or fails after consuming input, later encoding operations raise `BrotliSplice::Error`.
 
@@ -137,6 +142,28 @@ Compress `html` with a spliceable slot at the given byte position.
 }
 ```
 
+### `BrotliSplice.encode_slots(html, slots, quality: 11) → Hash`
+
+Compress `html` with a spliceable slot at each given byte range. With one
+range, `data` is identical to the output of `encode`.
+
+**Parameters:**
+- `html` — the full HTML string (binary encoding)
+- `slots` — `[offset, length]` byte ranges in ascending order. Ranges may touch
+  but must not overlap, and each length must be > 2
+- `quality:` — Brotli quality level, 0–11 (default: 11)
+
+**Returns** a Hash:
+```ruby
+{
+  data:           String,  # the Brotli-compressed stream
+  slots:          Array,   # one { offset:, length: } Hash per range, in order:
+                           # the replaceable bytes within the compressed stream
+                           # (length = range length - 2)
+  context_suffix: String,  # the 2 fixed context bytes ("\r\n")
+}
+```
+
 ### `BrotliSplice.replace(compressed_data, new_secret, secret_offset, secret_length) → String`
 
 Replace the secret in a compressed stream. Returns a new string with the
@@ -147,6 +174,15 @@ swapped bytes. This is a pure `memcpy` — no compression or decompression.
 - `new_secret` — replacement content, must be exactly `secret_length` bytes
 - `secret_offset` — from the `encode` result
 - `secret_length` — from the `encode` result
+
+### `BrotliSplice.replace_slots(compressed_data, replacements) → String`
+
+Replace several slots while copying `compressed_data` only once.
+`replacements` is an Array of `[new_secret, secret_offset, secret_length]`
+entries, with offsets and lengths from `encode_slots` or `Encoder#slots`.
+Entries must be in ascending offset order and must not overlap, as those methods
+return them; they may touch. Every entry is checked before any byte is copied,
+so an invalid entry raises `BrotliSplice::Error` and returns nothing.
 
 ## Example
 
@@ -185,8 +221,7 @@ longer, or place the suffix where a line break is natural).
 
 ## Limitations
 
-- The replaceable slot must be no larger than 65536 bytes, plus the 2-byte context suffix
+- Each replaceable slot must be no larger than 65536 bytes, plus the 2-byte context suffix
 - The replacement must be **exactly** `secret_length` bytes (no length changes)
-- The last 2 bytes of the original secret region become `\r\n` in the output
-- Only one spliceable slot per stream (encode with multiple slots would require
-  chaining encoders)
+- The last 2 bytes of each original slot region become `\r\n` in the output
+- Slots must not overlap
