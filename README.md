@@ -179,9 +179,10 @@ swapped bytes. This is a pure `memcpy` — no compression or decompression.
 
 Replace several slots while copying `compressed_data` only once.
 `replacements` is an Array of `[new_secret, secret_offset, secret_length]`
-entries, with offsets and lengths from `encode_slots` or `Encoder#slots`. Every
-entry is checked before any byte is copied, so an invalid entry raises
-`BrotliSplice::Error` and returns nothing.
+entries, with offsets and lengths from `encode_slots` or `Encoder#slots`.
+Entries must be in ascending offset order and must not overlap, as those methods
+return them; they may touch. Every entry is checked before any byte is copied,
+so an invalid entry raises `BrotliSplice::Error` and returns nothing.
 
 ## Example
 

@@ -399,6 +399,24 @@ class BrotliSpliceEncoderTest < Minitest::Test
     assert_raises(BrotliSplice::Error) { BrotliSplice.replace_slots(result[:data], [[secret, offset, slot[:length]]]) }
   end
 
+  def test_replace_slots_accepts_touching_replacements_and_rejects_overlapping_or_descending_ones
+    data = binary("abcdefgh").freeze
+
+    assert_equal("abXYZWgh", BrotliSplice.replace_slots(data, [[binary("XY"), 2, 2], [binary("ZW"), 4, 2]]))
+    assert_raises(BrotliSplice::Error) { BrotliSplice.replace_slots(data, [[binary("XY"), 2, 2], [binary("ZW"), 3, 2]]) }
+    assert_raises(BrotliSplice::Error) { BrotliSplice.replace_slots(data, [[binary("ZW"), 4, 2], [binary("XY"), 2, 2]]) }
+    assert_equal("abcdefgh", data)
+  end
+
+  def test_one_shot_apis_accept_a_64_kb_slot_body_and_reject_a_larger_one
+    html = binary("<p>" + ("x" * 65_537) + "\r\n</p>")
+
+    assert_equal(65_536, BrotliSplice.encode(html, 4, 65_538, quality: 1)[:secret_length])
+    assert_equal(65_536, BrotliSplice.encode_slots(html, [[4, 65_538]], quality: 1)[:slots].first[:length])
+    assert_raises(BrotliSplice::Error) { BrotliSplice.encode(html, 3, 65_539, quality: 1) }
+    assert_raises(BrotliSplice::Error) { BrotliSplice.encode_slots(html, [[0, 3], [3, 65_539]], quality: 1) }
+  end
+
   private
 
   def binary(value)

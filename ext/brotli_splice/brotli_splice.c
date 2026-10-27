@@ -15,6 +15,8 @@ static VALUE cEncoder;
 static VALUE eBrotliSpliceError;
 
 #define CTX_LEN 2
+/* An uncompressed meta-block header stores MLEN - 1 in 16 bits. */
+#define MAX_SLOT_BODY_LEN 65536
 #define OUTPUT_CHUNK_SIZE 16384
 static const uint8_t CTX_BYTES[CTX_LEN] = { '\r', '\n' };
 
@@ -356,7 +358,7 @@ static VALUE encoder_slot(VALUE self, VALUE bytes) {
     if (total_length <= CTX_LEN) rb_raise(eBrotliSpliceError, "slot must be longer than 2 bytes");
 
     size_t body_length = total_length - CTX_LEN;
-    if (body_length > 65536) rb_raise(eBrotliSpliceError, "slot body must not exceed 64 KB");
+    if (body_length > MAX_SLOT_BODY_LEN) rb_raise(eBrotliSpliceError, "slot body must not exceed 64 KB");
     if (memcmp(RSTRING_PTR(bytes) + body_length, CTX_BYTES, CTX_LEN) != 0) {
         rb_raise(eBrotliSpliceError, "slot must end with the context suffix \\r\\n");
     }
@@ -509,6 +511,7 @@ static VALUE rb_brotli_splice_encode(int argc, VALUE *argv, VALUE self) {
     if (secret_offset > html_length || secret_length > html_length - secret_offset) {
         rb_raise(eBrotliSpliceError, "secret_offset + secret_length exceeds html size");
     }
+    if (secret_length - CTX_LEN > MAX_SLOT_BODY_LEN) rb_raise(eBrotliSpliceError, "slot body must not exceed 64 KB");
 
     size_t bounds[2] = {secret_offset, secret_length};
     VALUE pieces = slot_pieces(html, bounds, 1);
@@ -550,6 +553,7 @@ static VALUE rb_brotli_splice_encode_slots(int argc, VALUE *argv, VALUE self) {
         size_t offset = bounds[index * 2];
         size_t length = bounds[index * 2 + 1];
         if (length <= CTX_LEN) rb_raise(eBrotliSpliceError, "slot length must be > %d", CTX_LEN);
+        if (length - CTX_LEN > MAX_SLOT_BODY_LEN) rb_raise(eBrotliSpliceError, "slot body must not exceed 64 KB");
         if (offset > html_length || length > html_length - offset) {
             rb_raise(eBrotliSpliceError, "slot offset + length exceeds html size");
         }
@@ -615,6 +619,7 @@ static VALUE rb_brotli_splice_replace_slots(VALUE self, VALUE data, VALUE replac
     }
 
     size_t data_length = (size_t)RSTRING_LEN(data);
+    size_t previous_end = 0;
     for (long index = 0; index < count; index++) {
         VALUE secret = RARRAY_AREF(secrets, index);
         size_t offset = bounds[index * 2];
@@ -625,6 +630,10 @@ static VALUE rb_brotli_splice_replace_slots(VALUE self, VALUE data, VALUE replac
         if (offset > data_length || length > data_length - offset) {
             rb_raise(eBrotliSpliceError, "offset+length exceeds data size");
         }
+        if (offset < previous_end) {
+            rb_raise(eBrotliSpliceError, "replacements must be in ascending order and must not overlap");
+        }
+        previous_end = offset + length;
     }
 
     VALUE result = rb_str_dup(data);
